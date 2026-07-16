@@ -17,8 +17,7 @@ Tenant films their emptied unit on move-out day, right before returning keys. AI
 | Assumption | How we test it | Target |
 |---|---|---|
 | AI is accurate on amateur video | Staged-defect footage | ≥90% caught, ≤1 false-Good |
-| Tenants will participate | Hallway tests, then real pilot | ≥50% share rate |
-| PM would trust it | Demo + parallel manual inspection | ≤10% override rate |
+
 
 ## Scope
 
