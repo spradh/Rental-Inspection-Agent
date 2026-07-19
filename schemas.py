@@ -1,67 +1,108 @@
-"""Shared data contracts for the BI Analyst Agent.
+"""Shared data contracts for the Pre-Inspect pipeline.
 
-Every layer (tools, agents, api, streamlit) imports these — so the shapes are defined
-once. Keep this module dependency-free (only pydantic) to avoid import cycles.
+Every layer (tools, agents) imports these — so the shapes are defined once. Keep this
+module dependency-free (only pydantic) to avoid import cycles.
 """
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+Category = Literal[
+    "walls_paint",
+    "floors",
+    "cleanliness",
+    "appliances",
+    "fixtures_hardware",
+    "windows_screens",
+    "general_condition",
+]
+SessionType = Literal["move_in", "move_out"]
+Source = Literal["narration", "visual", "both"]
 
-class Chunk(BaseModel):
-    """A retrieved knowledge-base passage, with its source for citation."""
 
+class TimestampRef(BaseModel):
+    """A [start, end) window into the source video, in seconds."""
+
+    start_s: float
+    end_s: float
+
+
+class TranscriptSegment(BaseModel):
+    """One timestamped slice of the PM's narration (tools.perception output)."""
+
+    start_s: float
+    end_s: float
     text: str
-    source: str
-    score: float = 0.0
 
 
-class ChartSeries(BaseModel):
-    """One named numeric series in a chart (e.g. 'net_revenue')."""
+class VisualObservation(BaseModel):
+    """Something visibly present in the video, independent of narration.
 
-    name: str
-    values: list[float]
-
-
-class ChartSpec(BaseModel):
-    """A render-agnostic chart the agent built from REAL query rows (never invented).
-
-    Deliberately minimal and serializable so it travels through the JSON API and is trivial
-    to render (Streamlit st.bar_chart / line_chart / area_chart, or any charting lib). `x` are
-    the category/time labels; each series supplies one value per label.
+    Purely descriptive (tools.perception output) — no category, no room, no condition
+    judgment yet. agents.compile reconciles this against the transcript.
     """
 
-    type: Literal["bar", "line", "area"] = "bar"
-    title: str = ""
-    x_label: str = ""
-    y_label: str = ""
-    x: list[str] = Field(default_factory=list)
-    series: list[ChartSeries] = Field(default_factory=list)
+    start_s: float
+    end_s: float
+    description: str
 
 
-class AnalystAnswer(BaseModel):
-    """The structured result the agent returns — never free text alone.
+class Finding(BaseModel):
+    """One atomic item within a RoomReport.
 
-    Downstream (API, Streamlit, evals) consume this shape.
+    `description` documents what was observed (e.g. "scuff mark on the wall near the
+    doorway") — it must never be reduced to a good/bad rating or a condition score; see
+    InspectionReport's docstring for why.
     """
 
-    answer: str = Field(description="The analyst's answer, in prose.")
-    evidence: list[str] = Field(default_factory=list, description="Key facts/numbers the answer rests on.")
-    recommendations: list[str] = Field(default_factory=list, description="Ranked, actionable next steps.")
-    sql_used: list[str] = Field(default_factory=list, description="Any SQL the agent ran.")
-    citations: list[str] = Field(default_factory=list, description="KB sources used (e.g. data/docs/metric-definitions.md).")
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    chart: Optional[ChartSpec] = Field(default=None, description="An optional chart to render alongside the prose.")
+    category: Category
+    description: str
+    timestamp: TimestampRef
+    source: Source
+    narrated: bool = Field(description="False iff source == 'visual' (unnarrated but visible).")
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
-class Anomaly(BaseModel):
-    """A KPI deviation surfaced by the Watch capability."""
+class RoomReport(BaseModel):
+    """All findings for one room, grouped the way a PM reads the report."""
 
-    metric: str
-    finding: str
-    severity: str = "medium"            # low | medium | high
-    evidence: str = ""                  # the number(s) behind it
-    recommendation: str = ""
+    room: str
+    findings: list[Finding] = Field(default_factory=list)
+
+
+class FlaggedFinding(Finding):
+    """A Finding surfaced for PM confirm/dismiss, with its room re-attached.
+
+    Returned by InspectionReport.flagged_for_review() — a flat, self-contained shape for
+    a review queue, independent of the report's room-grouped body.
+    """
+
+    room: str
+
+
+class InspectionReport(BaseModel):
+    """The Week-1 deliverable: a compiled, room-by-room condition report.
+
+    Per the PRD's non-negotiables, this documents condition — it is never a Good/Bad
+    verdict and never a dollar figure. Each Finding's `description` carries the actual
+    observed detail; `flagged_for_review` derives (not re-judges) which findings the PM
+    never narrated, for them to confirm or dismiss.
+    """
+
+    session_type: SessionType
+    video_duration_s: float
+    rooms: list[RoomReport] = Field(default_factory=list)
+    summary: str = ""
+    generated_at: str = ""
+
+    def flagged_for_review(self) -> list[FlaggedFinding]:
+        """Findings visible in the video but never called out by the PM's narration."""
+        return [
+            FlaggedFinding(room=r.room, **f.model_dump())
+            for r in self.rooms
+            for f in r.findings
+            if not f.narrated
+        ]

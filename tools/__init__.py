@@ -1,10 +1,6 @@
-"""Tool registry for the BI Analyst Agent.
+"""Tools for the Pre-Inspect pipeline: video.probe and perception.analyze_video.
 
-The forecast model is provided (see project/tools/forecast/); the other tools wrap it
-plus SQL, KB retrieval, web analytics, actions, and anomaly detection. The registry is
-the single entry point the agent loop uses.
+The pipeline (agents.pipeline) is a fixed 3-step sequence, not an open-ended
+tool-calling loop, so there's no dynamic registry/dispatch layer here — callers import
+each tool module directly.
 """
-
-from project.tools.registry import REGISTRY, dispatch, get_tools, tool_schemas
-
-__all__ = ["REGISTRY", "dispatch", "get_tools", "tool_schemas"]
