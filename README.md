@@ -12,7 +12,7 @@ Property Manager walks the **vacant** unit — once before a new tenant moves in
 
 Two sessions, two independent reports:
 - **Move-in report** — Property Manager can hand this to the incoming tenant as a record of starting condition.
-- **Move-out report** — for the Property Manager 'sown records.
+- **Move-out report** — for the Property Manager'snown records.
 
 **Non-negotiables:** Property Manager only ever films a vacant unit (never an occupied one); report documents condition, never a dollar figure; raw video is discarded after the report is generated.
 
