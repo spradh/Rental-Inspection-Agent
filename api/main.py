@@ -1,127 +1,122 @@
-"""FastAPI service for the BI Analyst Agent — async, JSON, health check.
+"""FastAPI service for Pre-Inspect — async, JSON, health check.
 
-Production entrypoint for the reference implementation. The agent already exists in
-`project.agents`; this layer just exposes it over HTTP. `ask()` is atomic (returns a full
-AnalystAnswer), and /chat returns it as a single JSON response — no streaming.
-
-Deployed on Cloud Run, this service runs on **cloud backends only**: BigQuery (warehouse),
-Qdrant (vector store / retrieval), Redis (memory), LangSmith (tracing), and an LLM provider
-(OpenRouter). /health probes every one and returns 503 unless they're all online — so a deploy
-that's missing a service (env key) or can't reach one is held out of rotation.
+Production entrypoint for the video-walkthrough-to-report pipeline. The pipeline already
+exists in `project.agents` (`run_inspection`); this layer just exposes it over HTTP.
 
 Endpoints:
-    GET  /health   -> readiness probe: 503 unless a provider key is set AND every cloud service
-                      (BigQuery, Qdrant, Redis, LangSmith) is online.
-    POST /chat      -> run ask(...) and return the AnalystAnswer as JSON.
-    GET  /report    -> generate_report() as text/plain.
+    GET  /health    -> readiness probe: ffprobe on PATH + an LLM provider key set for both
+                       the perception and compile models.
+    POST /inspect   -> upload a walkthrough video (multipart) + session_type, run the full
+                       brain pipeline, and return the InspectionReport as JSON. The uploaded
+                       video is always deleted after processing (never persisted) — see the
+                       PRD's non-negotiable that raw video is discarded post-report.
 
 Run locally (from repo root):
     uvicorn project.api.main:app --reload
-    curl -s -X POST localhost:8000/chat -H 'content-type: application/json' \
-        -d '{"question":"What were top SKUs last month?"}'
+    curl -s -X POST localhost:8000/inspect \
+        -F "session_type=move_in" \
+        -F "video=@walkthrough.mp4"
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
+import tempfile
 import time
+from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, Response
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
-from project.agents import ask, generate_report
-from project.health import ONLINE, check_services
+from project.agents import InspectionReport, run_inspection
+from project.config import COMPILE_MODEL, MAX_VIDEO_S, PERCEPTION_MODEL
+from project.tools.video import VideoValidationError
 
-# ── Structured logging ───────────────────────────────────────────────
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format='{"level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}',
 )
-logger = logging.getLogger("bi-analyst")
+logger = logging.getLogger("pre-inspect")
 
-app = FastAPI(title="BI Analyst Agent", version="1.0.0")
+app = FastAPI(title="Pre-Inspect Agent", version="1.0.0")
 
-_PROVIDER_KEYS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
-
-
-class ChatRequest(BaseModel):
-    question: str
-    role: str = "analyst"
-    thread_id: str | None = None
-    user_id: str | None = None
+_PROVIDER_KEY_ENV = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
 
 
-def _run_ask(req: ChatRequest):
-    """Sync helper so the whole ask() call (including its kwargs) runs in one thread."""
-    return ask(
-        req.question,
-        role=req.role,
-        thread_id=req.thread_id,
-        user_id=req.user_id,
+def _provider_ok(model: str) -> tuple[bool, str]:
+    """model is 'provider:name' — return (key-is-set, provider)."""
+    provider, _, _ = model.partition(":")
+    env_var = _PROVIDER_KEY_ENV.get(provider)
+    return bool(env_var and os.getenv(env_var)), provider
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    """Readiness check: ffprobe on PATH + a provider key set for each configured model."""
+    import shutil
+
+    ffprobe_ok = shutil.which("ffprobe") is not None
+    perception_ok, perception_provider = _provider_ok(PERCEPTION_MODEL)
+    compile_ok, compile_provider = _provider_ok(COMPILE_MODEL)
+    ready = ffprobe_ok and perception_ok and compile_ok
+
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": "ok" if ready else "unready",
+            "ffprobe": ffprobe_ok,
+            "perception_model": {"model": PERCEPTION_MODEL, "provider_key_set": perception_ok},
+            "compile_model": {"model": COMPILE_MODEL, "provider_key_set": compile_ok},
+            "max_video_s": MAX_VIDEO_S,
+        },
     )
 
 
-@app.post("/chat")
-async def chat_endpoint(req: ChatRequest) -> Response:
-    """Run the agent and return the full AnalystAnswer as JSON."""
-    started = time.perf_counter()
-    try:
-        answer = await asyncio.to_thread(_run_ask, req)
-        logger.info(
-            'route=/chat status=ok latency_ms=%d thread_id=%s',
-            (time.perf_counter() - started) * 1000,
-            req.thread_id,
-        )
-        return Response(content=answer.model_dump_json(), media_type="application/json")
-    except Exception as exc:  # noqa: BLE001 — surface failures cleanly
-        logger.exception("route=/chat status=error")
-        return Response(
-            content=json.dumps({"error": f"agent failed: {type(exc).__name__}"}),
-            media_type="application/json",
-            status_code=500,
-        )
+def _run_inspection_sync(video_path: str, session_type: str) -> InspectionReport:
+    return run_inspection(video_path, session_type=session_type)
 
 
-@app.get("/report", response_class=PlainTextResponse)
-async def report_endpoint() -> Response:
-    """Return the autonomous weekly-review narrative as plain text."""
-    try:
-        text = await asyncio.to_thread(generate_report)
-        return PlainTextResponse(content=text)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("route=/report status=error")
-        return PlainTextResponse(
-            content=f"report failed: {type(exc).__name__}",
-            status_code=500,
-        )
+@app.post("/inspect")
+async def inspect_endpoint(
+    session_type: Literal["move_in", "move_out"] = Form(...),
+    video: UploadFile = File(...),
+) -> JSONResponse:
+    """Run the brain pipeline on an uploaded walkthrough video.
 
-
-# Path is `/health`, NOT `/healthz`: Google's frontend reserves the exact path `/healthz` on
-# *.run.app and 404s it before it reaches the container. `/health` is fine.
-@app.get("/health")
-async def health(response: Response) -> dict:
-    """Readiness check: a provider key AND every cloud backend online.
-
-    Probes BigQuery, Qdrant, Redis, and LangSmith (`project.health.check_services`) plus the LLM
-    provider key, and returns **503 unless the provider key is set and every service is ONLINE**.
-    So a deploy that's missing a service (env key unset → the probe reports "disabled") or can't
-    reach one ("offline") is held out of rotation until it's actually wired for all cloud
-    dependencies. The probes do network I/O, so they run off the event loop.
+    The video is written to a scratch temp file only for the duration of the pipeline run,
+    then always deleted — raw video is never persisted, per the PRD.
     """
-    services = await asyncio.to_thread(check_services)
-    provider_ok = any(os.getenv(k) for k in _PROVIDER_KEYS)
-    ready = provider_ok and all(s.status == ONLINE for s in services)
-    if not ready:
-        response.status_code = 503
-    return {
-        "status": "ok" if ready else "unready",
-        "provider": provider_ok,
-        "services": {s.key: {"status": s.status, "detail": s.detail} for s in services},
-    }
+    started = time.perf_counter()
+    suffix = Path(video.filename or "").suffix or ".mp4"
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(await video.read())
+            tmp_path = tmp.name
+
+        report = await asyncio.to_thread(_run_inspection_sync, tmp_path, session_type)
+        logger.info(
+            'route=/inspect status=ok latency_ms=%d session_type=%s',
+            (time.perf_counter() - started) * 1000,
+            session_type,
+        )
+        return JSONResponse(content=report.model_dump())
+    except VideoValidationError as exc:
+        logger.info("route=/inspect status=rejected detail=%s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — surface failures cleanly
+        logger.exception("route=/inspect status=error")
+        raise HTTPException(status_code=500, detail=f"pipeline failed: {type(exc).__name__}") from exc
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
